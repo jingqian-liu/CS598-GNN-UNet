@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /metrics:
+      - accuracy
+      - f1_score
+      - f1_max
+      - auprc
+  - override /decoder:
+      - graph_label
+
+callbacks:
+  early_stopping:
+    monitor: val/graph_label/accuracy
+    mode: "max"
+  model_checkpoint:
+    dirpath: 
+    monitor: val/graph_label/accuracy #val/graph_label/f1_max #val/graph_label/accuracy
+    mode: "max"
+    every_n_epochs: 1
+    save_top_k: 5 #-1
+
+task:
+  task: "classification"
+  classification_type: "binary"
+  metric_average: "micro"
+
+  losses:
+    graph_label: bce
+  label_smoothing: 0.0
+
+  output:
+    - "graph_label"
+  supervise_on:
+    - "graph_label"
+
+train:
+  - features: ca_seq
