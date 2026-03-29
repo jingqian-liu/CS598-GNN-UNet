@@ -1,7 +1,0 @@
-- features=ca_everything
-- task=multiclass_graph_classification
-- dataset=fold_fold
-- encoder=schnet
-- decoder=graph_label_bn_x2
-- trainer.max_epochs=1
-- logger=csv
