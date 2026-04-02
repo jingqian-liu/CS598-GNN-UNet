@@ -1,0 +1,11 @@
+datamodule:
+  _target_: proteinworkshop.datasets.atom3d_datamodule.ATOM3DDataModule
+  task: LBA
+  data_dir: ${env.paths.data}  # data lives at <data_dir>/LBA/splits/split-by-sequence-identity-{lba_split}/data/
+  lba_split: 30                # 30 or 60 (sequence identity split)
+  max_units: 0
+  unit: edge
+  batch_size: 8
+  num_workers: 4
+  pin_memory: false
+num_classes: 1                 # regression task: neglog binding affinity

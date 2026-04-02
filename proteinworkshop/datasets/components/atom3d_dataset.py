@@ -123,21 +123,18 @@ class BaseTransform:
 
 class LBATransform(BaseTransform):
     """
-    From https://github.com/drorlab/gvp-pytorch
+    Transforms LBA dataset entries into protein-only graphs using the full
+    protein chain (atoms_protein), excluding ligand atoms and hydrogens.
+    Label is the negated log binding affinity (neglog_aff).
     """
 
     def __call__(self, elem: Any, index: int = -1):
-        pocket, ligand = elem["atoms_pocket"], elem["atoms_ligand"]
-        df = pd.concat([pocket, ligand], ignore_index=True)
+        df = elem["atoms_protein"]
+        df = df[df["element"] != "H"].reset_index(drop=True)
 
         data = super().__call__(df)
         with torch.no_grad():
-            data.graph_y = elem["scores"]["neglog_aff"]
-            lig_flag = torch.zeros(
-                df.shape[0], device=self.device, dtype=torch.bool
-            )
-            lig_flag[-len(ligand) :] = 1
-            data.lig_flag = lig_flag
+            data.graph_y = torch.tensor(elem["scores"]["neglog_aff"])
         return data
 
 

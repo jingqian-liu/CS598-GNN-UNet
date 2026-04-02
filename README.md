@@ -21,7 +21,7 @@ python -m pip install -e .
 ```
 
 ## Training scripts
-Training scrips, including hyperparameters, can be found under the directory `scripts`.
+bash scripts/run_lba.sh 2> >(grep -v "Explicit valence" >&2)
 
 ## Citation
 

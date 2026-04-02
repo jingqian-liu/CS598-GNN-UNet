@@ -135,6 +135,80 @@ def featurize_ligand(mol) -> Data:
     return Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
 
 
+def featurize_ligand_from_lba(atoms_df, bonds_df) -> Data:
+    """Convert LBA ``atoms_ligand`` + ``bonds`` DataFrames into a PyG Data object.
+
+    The LBA dataset stores ligands as heavy-atom-only DataFrames with explicit
+    bond tables (Kekulized: bond type 1.0/2.0/3.0). This function builds an
+    RDKit mol from that data, sanitizes it so that hybridization, aromaticity,
+    ring membership, and conjugation flags are all computed correctly, then
+    delegates to :func:`featurize_ligand`.
+
+    Two quirks of the LBA dataset are handled here:
+    - Element symbols are stored in uppercase (e.g. ``'CL'``, ``'BR'``);
+      RDKit requires title-case (``'Cl'``, ``'Br'``).
+    - Some molecules fail full sanitization (e.g. unusual valence from the
+      way the PDB records bonds). In that case we fall back to computing only
+      the subset of sanitization flags needed for featurization.
+
+    :param atoms_df: ``atoms_ligand`` DataFrame from an LBA LMDB entry.
+        Must contain columns ``element``, ``x``, ``y``, ``z``.
+    :param bonds_df: ``bonds`` DataFrame from an LBA LMDB entry.
+        Must contain columns ``atom1`` (int), ``atom2`` (int), ``type`` (float:
+        1.0 = single, 2.0 = double, 3.0 = triple, 1.5 = aromatic).
+    :return: PyG ``Data`` with fields ``x``, ``pos``, ``edge_index``,
+        ``edge_attr`` — identical format to :func:`featurize_ligand`.
+    """
+    from rdkit import Chem
+
+    bond_type_map = {
+        1.0: Chem.BondType.SINGLE,
+        2.0: Chem.BondType.DOUBLE,
+        3.0: Chem.BondType.TRIPLE,
+        1.5: Chem.BondType.AROMATIC,
+    }
+
+    atoms = atoms_df.reset_index(drop=True)
+
+    rw = Chem.RWMol()
+    for _, row in atoms.iterrows():
+        # LBA stores elements in ALL-CAPS (e.g. 'CL', 'BR'); RDKit needs
+        # title-case ('Cl', 'Br'). str.capitalize() handles all cases.
+        element = str(row["element"]).capitalize()
+        rw.AddAtom(Chem.Atom(element))
+
+    for _, row in bonds_df.iterrows():
+        i, j = int(row["atom1"]), int(row["atom2"])
+        btype = bond_type_map.get(float(row["type"]), Chem.BondType.SINGLE)
+        if rw.GetBondBetweenAtoms(i, j) is None:
+            rw.AddBond(i, j, btype)
+
+    mol = rw.GetMol()
+
+    # Full sanitization computes hybridization, aromaticity, ring info, and
+    # conjugation — all needed by featurize_ligand. If it fails (e.g. unusual
+    # valence from PDB bond records), fall back to the subset that doesn't
+    # enforce valence rules but still computes the other properties.
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        Chem.SanitizeMol(
+            mol,
+            Chem.SanitizeFlags.SANITIZE_FINDRADICALS
+            | Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+            | Chem.SanitizeFlags.SANITIZE_SETCONJUGATION
+            | Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION
+            | Chem.SanitizeFlags.SANITIZE_SYMMRINGS,
+        )
+
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for idx, row in atoms.iterrows():
+        conf.SetAtomPosition(idx, (float(row["x"]), float(row["y"]), float(row["z"])))
+    mol.AddConformer(conf, assignId=True)
+
+    return featurize_ligand(mol)
+
+
 class LigandGVPEncoder(torch.nn.Module):
     """GVP-GNN encoder for 3D ligand graphs.
 

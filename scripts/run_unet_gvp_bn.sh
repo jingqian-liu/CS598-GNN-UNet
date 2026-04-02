@@ -4,7 +4,7 @@ source scripts/common.sh
 cd "$(dirname "$0")"/..
 
 LR=${LR:-0.0005}
-ENCODER=${ENCODER:-gvp}
+ENCODER=${ENCODER:-unet_gvp_enc_dec_add}
 DECODER=${DECODER:-graph_label_bn_x2}
 DATASET=${DATASET:-fold_fold}
 WD=${WD:-1e-3}
