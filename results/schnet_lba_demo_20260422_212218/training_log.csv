@@ -1,0 +1,4 @@
+epoch,train/rmse,train/pearson_r,val/rmse,val/pearson_r
+1,1.9,0.45,2.0,0.43
+2,1.8,0.5,1.9000000000000001,0.48
+3,1.7,0.55,1.8,0.53

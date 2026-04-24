@@ -1,0 +1,5 @@
+{
+  "rmse": 1.8,
+  "pearson_r": 0.55,
+  "n_samples": 800
+}

@@ -272,4 +272,3 @@ dependencies:
       - zipp==3.21.0
       - zope-event==5.0
       - zope-interface==7.2
-prefix: /home/aoj/miniconda3/envs/gnn_unet
