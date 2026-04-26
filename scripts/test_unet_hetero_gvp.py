@@ -10,7 +10,7 @@ import sys
 import torch
 from torch_geometric.data import Batch, Data, HeteroData
 
-sys.path.insert(0, "/data/server5/jl126/GNN_UNet")
+sys.path.insert(0, "/scratch/ziyiz14/data/GNN_Unet")
 
 import atom3d.datasets.datasets as da
 from proteinworkshop.datasets.components.atom3d_dataset import (
@@ -27,7 +27,7 @@ from proteinworkshop.models.graph_encoders.unet_hetero_gvp import (
 )
 
 BATCH_SIZE = 8
-BASE = "/data/server5/jl126/GNN_UNet/proteinworkshop/data/LBA/splits"
+BASE = "/scratch/ziyiz14/data/GNN_Unet/data"
 
 FEATURISER = ProteinFeaturiser(
     representation="CA",

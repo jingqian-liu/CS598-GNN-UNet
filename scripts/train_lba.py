@@ -24,7 +24,7 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, "/data/server5/jl126/GNN_UNet")
+sys.path.insert(0, "/scratch/ziyiz14/data/GNN_UNet")
 
 import torch
 torch.set_float32_matmul_precision("high")   # avoids precision warnings; stable on RTX
@@ -39,7 +39,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torchmetrics import MeanAbsoluteError, MeanSquaredError, PearsonCorrCoef
 
 from proteinworkshop.datasets.lba_hetero_dataset import LBAHeteroDataModule
-from proteinworkshop.models.graph_encoders.unet_hetero_gvp import UnetHeteroGVPForLBA
+from proteinworkshop.models.graph_encoders.unet_hetero_gvp import UnetHeteroGVPForLBA, UnetHeteroGVPEncoderOnlyForLBA
 
 
 # ------------------------------------------------------------------ #
@@ -52,6 +52,7 @@ class LBALightningModule(L.LightningModule):
     def __init__(
         self,
         # encoder
+        model_name: str="UnetHeteroGVPForLBA",
         s_dim: int = 128,
         v_dim: int = 16,
         s_dim_edge: int = 32,
@@ -76,24 +77,41 @@ class LBALightningModule(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-
-        self.model = UnetHeteroGVPForLBA(
-            s_dim=s_dim,
-            v_dim=v_dim,
-            s_dim_edge=s_dim_edge,
-            v_dim_edge=v_dim_edge,
-            r_max=r_max,
-            num_bessel=num_bessel,
-            num_polynomial_cutoff=num_polynomial_cutoff,
-            num_layers=num_layers,
-            pool=pool,
-            fps_ratio=fps_ratio,
-            cross_cutoff=cross_cutoff,
-            enc_drop_rate=enc_drop_rate,
-            head_hidden_dim=head_hidden_dim,
-            head_drop_rate=head_drop_rate,
-        )
-
+        if model_name == "UnetHeteroGVPForLBA":
+            self.model = UnetHeteroGVPForLBA(
+                s_dim=s_dim,
+                v_dim=v_dim,
+                s_dim_edge=s_dim_edge,
+                v_dim_edge=v_dim_edge,
+                r_max=r_max,
+                num_bessel=num_bessel,
+                num_polynomial_cutoff=num_polynomial_cutoff,
+                num_layers=num_layers,
+                pool=pool,
+                fps_ratio=fps_ratio,
+                cross_cutoff=cross_cutoff,
+                enc_drop_rate=enc_drop_rate,
+                head_hidden_dim=head_hidden_dim,
+                head_drop_rate=head_drop_rate,
+            )
+        else:
+            self.model = UnetHeteroGVPEncoderOnlyForLBA(
+                s_dim=s_dim,
+                v_dim=v_dim,
+                s_dim_edge=s_dim_edge,
+                v_dim_edge=v_dim_edge,
+                r_max=r_max,
+                num_bessel=num_bessel,
+                num_polynomial_cutoff=num_polynomial_cutoff,
+                num_layers=num_layers,
+                pool=pool,
+                fps_ratio=fps_ratio,
+                cross_cutoff=cross_cutoff,
+                enc_drop_rate=enc_drop_rate,
+                head_hidden_dim=head_hidden_dim,
+                head_drop_rate=head_drop_rate,
+            )
+        
         # Metrics — instantiate one set per phase to avoid state leakage
         for phase in ("train", "val", "test"):
             setattr(self, f"{phase}_rmse", MeanSquaredError(squared=False))
@@ -193,9 +211,10 @@ def parse_args():
     p.add_argument("--batch_size",  type=int,   default=8)
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--data_root",   type=str,
-                   default="/data/server5/jl126/GNN_UNet/proteinworkshop/data/LBA/splits")
+                   default="/scratch/ziyiz14/data/GNN_Unet/data")
 
     # Model — encoder
+    p.add_argument("--model_name",        type=str,   default="UnetHeteroGVPForLBA")
     p.add_argument("--s_dim",        type=int,   default=128)
     p.add_argument("--v_dim",        type=int,   default=16)
     p.add_argument("--s_dim_edge",   type=int,   default=32)
@@ -261,6 +280,7 @@ def main():
     # Model                                                              #
     # ---------------------------------------------------------------- #
     model = LBALightningModule(
+        model_name=args.model_name,
         s_dim=args.s_dim,
         v_dim=args.v_dim,
         s_dim_edge=args.s_dim_edge,
