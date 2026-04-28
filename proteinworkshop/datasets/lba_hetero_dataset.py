@@ -17,7 +17,7 @@ from proteinworkshop.features.factory import ProteinFeaturiser
 from proteinworkshop.features.sequence_features import amino_acid_one_hot
 from proteinworkshop.models.graph_encoders.ligand_gvp import featurize_ligand_from_lba
 
-_DATA_ROOT = "/data/server5/jl126/GNN_UNet/proteinworkshop/data/LBA/splits"
+_DATA_ROOT = "/scratch/ziyiz14/data/GNN_Unet/data"
 
 # Shared featuriser config (CA-level, same as fold classification)
 _FEATURISER = ProteinFeaturiser(

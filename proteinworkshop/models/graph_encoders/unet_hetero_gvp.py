@@ -510,6 +510,280 @@ class UnetHeteroGVP(nn.Module):
             "lig_node_embedding":  out_lig,      # [N_l, s_dim]
         }
 
+class UnetHeteroGVPEncoderOnly(nn.Module):
+    """
+    Heterogeneous UNet-GVP encoder for protein-ligand graphs.
+    Only use the down path for prediction.
+
+    Protein nodes are down-sampled via FPS (every other layer);
+    ligand nodes remain at full atom resolution throughout.
+    After each FPS step, PP and cross (PL/LP) edges are rebuilt from
+    the new positions; LL edges are fixed.
+    """
+
+    def __init__(
+        self,
+        s_dim: int = 128,
+        v_dim: int = 16,
+        s_dim_edge: int = 32,
+        v_dim_edge: int = 1,
+        r_max: float = 10.0,
+        num_bessel: int = 8,
+        num_polynomial_cutoff: int = 5,
+        num_layers: int = 5,
+        pool: str = "sum",
+        fps_ratio: float = 0.6,
+        cross_cutoff: float = 6.0,
+        drop_rate: float = 0.1,
+    ):
+        """
+        :param s_dim: scalar node embedding dimension
+        :param v_dim: vector node embedding dimension (number of 3-D vectors)
+        :param s_dim_edge: scalar edge embedding dimension
+        :param v_dim_edge: vector edge embedding dimension
+        :param r_max: maximum radius for Bessel basis
+        :param num_bessel: number of Bessel radial basis functions
+        :param num_polynomial_cutoff: polynomial envelope order
+        :param num_layers: total number of down-path GNN layers
+        :param pool: global pooling method (``"sum"`` / ``"mean"`` / ``"max"``)
+        :param fps_ratio: FPS sampling ratio for protein nodes (0 < ratio < 1)
+        :param cross_cutoff: distance cutoff (Å) for protein-ligand cross edges
+        :param drop_rate: dropout probability
+        """
+        super().__init__()
+        node_dims     = (s_dim, v_dim)
+        edge_dims     = (s_dim_edge, v_dim_edge)
+        self.s_dim        = s_dim
+        self.fps_ratio    = fps_ratio
+        self.cross_cutoff = cross_cutoff
+        num_up_downs      = num_layers // 2
+        self.num_up_downs = num_up_downs
+        activations       = (F.relu, None)
+
+        # ---------------------------------------------------------- #
+        # Node input embeddings                                        #
+        # ---------------------------------------------------------- #
+        # Scalar projection (LazyLinear handles arbitrary input dim)
+        # followed by GVP (s,0) → (s, v) to introduce vector channels.
+        self.emb_in_prot = nn.LazyLinear(s_dim)
+        self.emb_in_lig  = nn.LazyLinear(s_dim)
+        self.W_v_prot = nn.Sequential(
+            gvp.LayerNorm((s_dim, 0)),
+            gvp.GVP((s_dim, 0), node_dims, activations=(None, None), vector_gate=True),
+        )
+        self.W_v_lig = nn.Sequential(
+            gvp.LayerNorm((s_dim, 0)),
+            gvp.GVP((s_dim, 0), node_dims, activations=(None, None), vector_gate=True),
+        )
+
+        # ---------------------------------------------------------- #
+        # Edge embeddings                                               #
+        # ---------------------------------------------------------- #
+        self.radial_emb = blocks.RadialEmbeddingBlock(
+            r_max=r_max,
+            num_bessel=num_bessel,
+            num_polynomial_cutoff=num_polynomial_cutoff,
+        )
+        radial_dim = self.radial_emb.out_dim
+
+        def _radial_embedder():
+            return nn.Sequential(
+                gvp.LayerNorm((radial_dim, 1)),
+                gvp.GVP((radial_dim, 1), edge_dims, activations=(None, None), vector_gate=True),
+            )
+
+        def _bond_embedder():
+            # LL bond features: 6 scalar (bond type 4-hot, ring, conjugated), 1 vector
+            return nn.Sequential(
+                gvp.LayerNorm((6, 1)),
+                gvp.GVP((6, 1), edge_dims, activations=(None, None), vector_gate=True),
+            )
+
+        # PP edges: one embedder per FPS level (down + up)
+        # W_e_pp_d[0] is shared between level-0 initial embedding and first FPS level
+        self.W_e_pp_d  = ModuleList([_radial_embedder() for _ in range(num_up_downs)])
+        self.W_e_pp_up = ModuleList([_radial_embedder() for _ in range(num_up_downs)])
+
+        # LL edges: single fixed embedder (ligand topology never changes)
+        self.W_e_ll = _bond_embedder()
+
+        # Cross PL/LP edges: same embedder for both directions (distance = same;
+        # direction vectors are negated for LP, which GVP handles equivariantly)
+        self.W_e_cross_d  = ModuleList([_radial_embedder() for _ in range(num_up_downs)])
+        self.W_e_cross_up = ModuleList([_radial_embedder() for _ in range(num_up_downs)])
+
+        # ---------------------------------------------------------- #
+        # GNN layers                                                   #
+        # ---------------------------------------------------------- #
+        def _layer():
+            return HeteroGVPLayer(
+                node_dims, edge_dims,
+                drop_rate=drop_rate,
+                activations=activations,
+                vector_gate=True,
+            )
+
+        self.layers_d  = nn.ModuleList([_layer() for _ in range(num_layers)])
+        self.layers_up = nn.ModuleList([_layer() for _ in range(num_up_downs)])
+
+        # ---------------------------------------------------------- #
+        # FPS aggregation (protein scalar via GINConv, vector via scatter) #
+        # ---------------------------------------------------------- #
+        self.reds_prot = ModuleList()
+        for _ in range(num_up_downs):
+            mlp = MLP([s_dim, s_dim, s_dim], act="relu", norm=None)
+            self.reds_prot.append(GINConv(nn=mlp, train_eps=False))
+
+        # ---------------------------------------------------------- #
+        # Output projection                                            #
+        # ---------------------------------------------------------- #
+        self.W_out_prot = nn.Sequential(
+            gvp.LayerNorm(node_dims),
+            gvp.GVP(node_dims, (s_dim, 0), activations=activations, vector_gate=True),
+        )
+        self.W_out_lig = nn.Sequential(
+            gvp.LayerNorm(node_dims),
+            gvp.GVP(node_dims, (s_dim, 0), activations=activations, vector_gate=True),
+        )
+
+        self.readout = get_aggregation(pool)
+
+    # -------------------------------------------------------------- #
+    # Forward                                                          #
+    # -------------------------------------------------------------- #
+
+    def forward(self, batch):
+        """
+        :param batch: PyG HeteroData batch (from ``Batch.from_data_list``).
+            Expected attributes:
+
+            * ``batch["protein"].x``           [N_p, 41]
+            * ``batch["protein"].pos``          [N_p, 3]
+            * ``batch["protein"].batch``        [N_p]
+            * ``batch["ligand"].x``             [N_l, 40]
+            * ``batch["ligand"].pos``           [N_l, 3]
+            * ``batch["ligand"].batch``         [N_l]
+            * ``batch["protein","contact","protein"].edge_index``       [2, E_pp]
+            * ``batch["ligand","bond","ligand"].edge_index``            [2, E_ll]
+            * ``batch["ligand","bond","ligand"].edge_attr``             [E_ll, 6]
+            * ``batch["ligand","bond","ligand"].edge_vector_attr``      [E_ll, 1, 3]
+            * ``batch["protein","interacts","ligand"].edge_index``      [2, E_pl]
+            * ``batch["ligand","interacts","protein"].edge_index``      [2, E_lp]
+
+        :return: dict with keys:
+            * ``"graph_embedding"``      [B, 2*s_dim]  protein+ligand pooled
+            * ``"node_embedding"``       [N_p, s_dim]  protein node embeddings
+            * ``"lig_node_embedding"``   [N_l, s_dim]  ligand  node embeddings
+        """
+        # ---------------------------------------------------------- #
+        # Unpack                                                        #
+        # ---------------------------------------------------------- #
+        pos_prot   = batch["protein"].pos
+        batch_prot = batch["protein"].batch
+        pos_lig    = batch["ligand"].pos
+        batch_lig  = batch["ligand"].batch
+
+        edge_pp = batch["protein", "contact",   "protein"].edge_index
+        edge_ll = batch["ligand",  "bond",       "ligand"].edge_index
+        edge_pl = batch["protein", "interacts",  "ligand"].edge_index
+        edge_lp = batch["ligand",  "interacts",  "protein"].edge_index
+
+        ll_raw_s = batch["ligand", "bond", "ligand"].edge_attr         # [E_ll, 6]
+        ll_raw_v = batch["ligand", "bond", "ligand"].edge_vector_attr  # [E_ll, 1, 3]
+
+        # ---------------------------------------------------------- #
+        # Initial node embeddings                                       #
+        # ---------------------------------------------------------- #
+        h_prot = self.W_v_prot(self.emb_in_prot(batch["protein"].x))
+        h_lig  = self.W_v_lig(self.emb_in_lig(batch["ligand"].x))
+
+        # ---------------------------------------------------------- #
+        # Initial edge embeddings                                       #
+        # PP: use W_e_pp_d[0] (shared with first FPS level, like orig) #
+        # LL: computed once, reused throughout                          #
+        # Cross: use W_e_cross_d[0]                                    #
+        # ---------------------------------------------------------- #
+        pp_s, pp_v = _edge_feats(pos_prot, pos_prot, edge_pp, self.radial_emb)
+        h_E_pp = self.W_e_pp_d[0]((pp_s, pp_v))
+
+        h_E_ll = self.W_e_ll((ll_raw_s, ll_raw_v))
+
+        pl_s, pl_v = _edge_feats(pos_prot, pos_lig, edge_pl, self.radial_emb)
+        h_E_pl = self.W_e_cross_d[0]((pl_s,  pl_v))
+        h_E_lp = self.W_e_cross_d[0]((pl_s, -pl_v))
+
+        # ---------------------------------------------------------- #
+        # Down path                                                     #
+        # ---------------------------------------------------------- #
+        # skip_stack: saves (h_prot, pos_prot, batch_prot, edge_pp)
+        #             at the pre-FPS resolution for each FPS step.
+        # fps_stack:  saves the fps_idx that maps into the saved level.
+        skip_stack = []
+        fps_stack  = []
+
+        for i, layer in enumerate(self.layers_d):
+            if i % 2 == 1:
+                # Save state at current (pre-FPS) resolution
+                skip_stack.append((h_prot, pos_prot, batch_prot, edge_pp))
+
+                # FPS on protein nodes
+                fps_idx = fps(pos_prot, batch_prot, self.fps_ratio)
+                fps_stack.append(fps_idx)
+
+                # Aggregate protein features into selected nodes
+                level = i // 2 - 1   # 0 for i=1, 1 for i=3, …
+                row, col = edge_pp
+                h_s = self.reds_prot[level](h_prot[0], edge_pp)[fps_idx]
+                h_v = scatter_add(
+                    h_prot[1][row], col, dim=0, dim_size=h_prot[1].shape[0]
+                )[fps_idx]
+                h_prot = (h_s, h_v)
+
+                pos_prot   = pos_prot[fps_idx]
+                batch_prot = batch_prot[fps_idx]
+
+                # Rebuild PP edges (KNN-16 on down-sampled Cα)
+                edge_pp, _ = compute_new_edges(pos_prot, batch_prot, "knn_16")
+                pp_s, pp_v = _edge_feats(pos_prot, pos_prot, edge_pp, self.radial_emb)
+                h_E_pp = self.W_e_pp_d[level]((pp_s, pp_v))
+
+                # Rebuild cross edges (distance cutoff between new Cα and ligand atoms)
+                cross  = pyg_radius(
+                    pos_lig, pos_prot, r=self.cross_cutoff,
+                    batch_x=batch_lig, batch_y=batch_prot,
+                )
+                edge_pl = cross              # row0 = prot, row1 = lig
+                edge_lp = cross[[1, 0]]      # row0 = lig,  row1 = prot
+
+                pl_s, pl_v = _edge_feats(pos_prot, pos_lig, edge_pl, self.radial_emb)
+                h_E_pl = self.W_e_cross_d[level]((pl_s,  pl_v))
+                h_E_lp = self.W_e_cross_d[level]((pl_s, -pl_v))
+
+            h_prot, h_lig = layer(
+                h_prot, h_lig,
+                edge_pp, h_E_pp,
+                edge_ll, h_E_ll,
+                edge_pl, h_E_pl,
+                edge_lp, h_E_lp,
+            )
+
+        # ---------------------------------------------------------- #
+        # Output projection + global pooling                           #
+        # ---------------------------------------------------------- #
+        out_prot = self.W_out_prot(h_prot)   # [N_p, s_dim]
+        out_lig  = self.W_out_lig(h_lig)     # [N_l, s_dim]
+
+        prot_graph_emb = self.readout(out_prot, batch_prot)   # [B, s_dim]
+        lig_graph_emb  = self.readout(out_lig,  batch_lig)    # [B, s_dim]
+
+        graph_emb = torch.cat([prot_graph_emb, lig_graph_emb], dim=-1)  # [B, 2*s_dim]
+
+        return {
+            "graph_embedding":     graph_emb,   # [B, 2*s_dim]
+            "node_embedding":      out_prot,     # [N_p, s_dim]  (full-resolution protein)
+            "lig_node_embedding":  out_lig,      # [N_l, s_dim]
+        }
+
 
 # ------------------------------------------------------------------ #
 # LBA Regression Head                                                  #
@@ -594,6 +868,74 @@ class UnetHeteroGVPForLBA(nn.Module):
     ):
         super().__init__()
         self.encoder = UnetHeteroGVP(
+            s_dim=s_dim,
+            v_dim=v_dim,
+            s_dim_edge=s_dim_edge,
+            v_dim_edge=v_dim_edge,
+            r_max=r_max,
+            num_bessel=num_bessel,
+            num_polynomial_cutoff=num_polynomial_cutoff,
+            num_layers=num_layers,
+            pool=pool,
+            fps_ratio=fps_ratio,
+            cross_cutoff=cross_cutoff,
+            drop_rate=enc_drop_rate,
+        )
+        self.head = LBARegressionHead(
+            in_dim=2 * s_dim,
+            hidden_dim=head_hidden_dim,
+            drop_rate=head_drop_rate,
+        )
+        self.loss_fn = nn.MSELoss()
+
+    def forward(self, batch):
+        """
+        :param batch: HeteroData batch (see UnetHeteroGVP.forward).
+        :return: dict with keys:
+            * ``"pred"``   [B]  predicted affinities
+            * ``"loss"``   scalar MSE loss (only if ``batch["graph_y"]`` exists)
+        """
+        enc_out = self.encoder(batch)
+        pred    = self.head(enc_out["graph_embedding"])   # [B]
+
+        out = {"pred": pred}
+        if hasattr(batch, "graph_y") or "graph_y" in batch:
+            target = batch["graph_y"].float()
+            out["loss"] = self.loss_fn(pred, target)
+        return out
+
+class UnetHeteroGVPEncoderOnlyForLBA(nn.Module):
+    """
+    End-to-end protein-ligand binding affinity predictor.
+    Only use the down path for prediction.
+
+    Encoder : UnetHeteroGVP  →  graph_embedding [B, 2*s_dim]
+    Head    : LBARegressionHead  →  predicted_affinity [B]
+
+    Loss is MSE between predicted and target neglog affinity.
+    """
+
+    def __init__(
+        self,
+        # encoder hyper-parameters
+        s_dim: int = 128,
+        v_dim: int = 16,
+        s_dim_edge: int = 32,
+        v_dim_edge: int = 1,
+        r_max: float = 10.0,
+        num_bessel: int = 8,
+        num_polynomial_cutoff: int = 5,
+        num_layers: int = 5,
+        pool: str = "sum",
+        fps_ratio: float = 0.6,
+        cross_cutoff: float = 6.0,
+        enc_drop_rate: float = 0.1,
+        # head hyper-parameters
+        head_hidden_dim: int = 256,
+        head_drop_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.encoder = UnetHeteroGVPEncoderOnly(
             s_dim=s_dim,
             v_dim=v_dim,
             s_dim_edge=s_dim_edge,

@@ -94,7 +94,7 @@ class LBALightningModule(L.LightningModule):
                 head_hidden_dim=head_hidden_dim,
                 head_drop_rate=head_drop_rate,
             )
-        else:
+        elif model_name == "UnetHeteroGVPEncoderOnlyForLBA":
             self.model = UnetHeteroGVPEncoderOnlyForLBA(
                 s_dim=s_dim,
                 v_dim=v_dim,
